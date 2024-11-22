@@ -502,6 +502,11 @@ as the source and the destination will be the same file.
 
 This feature may be useful backups made with --copy-dest.`,
 			Advanced: true,
+		}, {
+			Name:     "resume",
+			Default:  false,
+			Help:     `Turn on resume feature for upload files. Same as sftp put -a.`,
+			Advanced: false,
 		}},
 	}
 	fs.Register(fsi)
@@ -546,6 +551,7 @@ type Options struct {
 	SSH                     fs.SpaceSepList `config:"ssh"`
 	SocksProxy              string          `config:"socks_proxy"`
 	CopyIsHardlink          bool            `config:"copy_is_hardlink"`
+	Resume                  bool            `config:"resume"`
 }
 
 // Fs stores the interface to the remote SFTP files
@@ -2159,17 +2165,104 @@ func (sr *sizeReader) Size() int64 {
 	return sr.size
 }
 
-// Update a remote sftp file using the data <in> and ModTime from <src>
-func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	o.fs.addSession() // Show session in use
-	defer o.fs.removeSession()
-	// Clear the hash cache since we are about to update the object
-	o.md5sum = nil
-	o.sha1sum = nil
-	c, err := o.fs.getSftpConnection(ctx)
-	if err != nil {
-		return fmt.Errorf("Update: %w", err)
+func readSeek(in io.Reader, size int64) error {
+	bufSize := 1048576
+	buf := make([]byte, bufSize)
+	if size <= int64(bufSize) {
+		_, err := in.Read(buf[0:size])
+		return err
 	}
+	rsize := bufSize
+	totalRead := 0
+	for {
+		n, err := in.Read(buf[0:rsize])
+		if err != nil {
+			return err
+		}
+		totalRead += n
+		restSize := int(size) - totalRead
+		if restSize < bufSize {
+			rsize = restSize
+		}
+		if restSize == 0 {
+			break
+		} else if restSize < 0 {
+			panic("BUG")
+		}
+	}
+	return nil
+}
+
+func (o *Object) updateWithResume(ctx context.Context, c *conn, in io.Reader, src fs.ObjectInfo) error {
+	var (
+		file *sftp.File
+		err  error
+	)
+	rfinfo, serr := c.sftpClient.Stat(o.path())
+	if serr != nil {
+		// Should use raw open
+		file, err = c.sftpClient.OpenFile(o.path(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	} else {
+		// Can use readSeek method to skip already uploaded size
+		file, err = c.sftpClient.OpenFile(o.path(), os.O_WRONLY|os.O_APPEND)
+		if err != nil {
+			o.fs.putSftpConnection(&c, err)
+			return err
+		}
+		// use readSeek to skip already uploaded bytes
+		rfSize := rfinfo.Size()
+		serr := readSeek(in, rfSize)
+		// if readSeek got error means it has some problem so just return error
+		if serr != nil {
+			// TODO: should the file in remote server need to be deleted?
+			o.fs.putSftpConnection(&c, serr)
+			return serr
+		}
+	}
+	// Hang on to the connection for the whole upload so it doesn't get reused while we are uploading
+	if err != nil {
+		o.fs.putSftpConnection(&c, err)
+		return fmt.Errorf("Update Create failed: %w", err)
+	}
+
+	_, err = file.ReadFrom(&sizeReader{Reader: in, size: src.Size()})
+	if err != nil {
+		o.fs.putSftpConnection(&c, err)
+		return fmt.Errorf("Update ReadFrom failed: %w", err)
+	}
+	err = file.Close()
+	if err != nil {
+		o.fs.putSftpConnection(&c, err)
+		return fmt.Errorf("Update Close failed: %w", err)
+	}
+	// Release connection only when upload has finished so we don't upload multiple files on the same connection
+	o.fs.putSftpConnection(&c, err)
+
+	// Set the mod time - this stats the object if o.fs.opt.SetModTime == true
+	err = o.SetModTime(ctx, src.ModTime(ctx))
+	if err != nil {
+		return fmt.Errorf("Update SetModTime failed: %w", err)
+	}
+
+	// Stat the file after the upload to read its stats back if o.fs.opt.SetModTime == false
+	if !o.fs.opt.SetModTime {
+		err = o.stat(ctx)
+		if err == fs.ErrorObjectNotFound {
+			// In the specific case of o.fs.opt.SetModTime == false
+			// if the object wasn't found then don't return an error
+			fs.Debugf(o, "Not found after upload with set_modtime=false so returning best guess")
+			o.modTime = uint32(src.ModTime(ctx).Unix())
+			o.size = src.Size()
+			o.mode = os.FileMode(0666) // regular file
+		} else if err != nil {
+			return fmt.Errorf("Update stat failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (o *Object) updateNormal(ctx context.Context, c *conn, in io.Reader, src fs.ObjectInfo) error {
 	// Hang on to the connection for the whole upload so it doesn't get reused while we are uploading
 	file, err := c.sftpClient.OpenFile(o.path(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
@@ -2228,6 +2321,25 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	return nil
+}
+
+// Update a remote sftp file using the data <in> and ModTime from <src>
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	o.fs.addSession() // Show session in use
+	defer o.fs.removeSession()
+	// Clear the hash cache since we are about to update the object
+	o.md5sum = nil
+	o.sha1sum = nil
+	c, err := o.fs.getSftpConnection(ctx)
+	if err != nil {
+		return fmt.Errorf("Update: %w", err)
+	}
+	if o.fs.opt.Resume {
+		fs.Debugf(o, "Use append mode to upload sftp file")
+		return o.updateWithResume(ctx, c, in, src)
+	}
+	fs.Debugf(o, "Use normal mode to upload sftp file")
+	return o.updateNormal(ctx, c, in, src)
 }
 
 // Remove a remote sftp file object
